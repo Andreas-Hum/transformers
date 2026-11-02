@@ -230,6 +230,29 @@ class DistributedMixin:
 
         return expanded_plan
 
+    def _resolve_tied_weights_tp_plan(self, tp_plan: dict[str, str]) -> dict[str, str]:
+        """Shard all modules of tied weights or none: add `embedding_rowwise` to embeddings, else replicate them all."""
+        groups = {}
+        for target, source in (getattr(self, "all_tied_weights_keys", None) or {}).items():
+            groups.setdefault(source, [source]).append(target)
+
+        modules = dict(self.named_modules())
+        for weights in groups.values():
+            unsharded = [name for name in weights if not {name, name.rpartition(".")[0]} & tp_plan.keys()]
+            if not unsharded or len(unsharded) == len(weights):
+                continue
+            if all(isinstance(modules.get(name.rpartition(".")[0]), torch.nn.Embedding) for name in unsharded):
+                for name in unsharded:
+                    tp_plan[name] = tp_plan[name.rpartition(".")[0]] = "embedding_rowwise"
+                decision = f"sharding {unsharded} with `embedding_rowwise`"
+            else:
+                sharded_modules = {name.rpartition(".")[0] for name in weights if name not in unsharded}
+                tp_plan = {k: v for k, v in tp_plan.items() if not {k, k.rpartition(".")[0]} & sharded_modules}
+                decision = f"replicating {sorted(sharded_modules)}"
+            if _get_torch_distributed_rank() == 0:
+                logger.info(f"Tied weights {weights} are sharded only in part: {decision}.")
+        return tp_plan
+
     def _resolve_parallel_plans(
         self, distributed_config: DistributedConfig
     ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -285,7 +308,7 @@ class DistributedMixin:
             fp32_modules = {name.rpartition(".")[0] for name in param_names if kept_in_fp32.search(name)}
             fsdp_plan = dict.fromkeys(fp32_modules, "free_full_weight") | fsdp_plan
 
-        tp_plan = self._expand_parallel_plan(tp_plan)
+        tp_plan = self._resolve_tied_weights_tp_plan(self._expand_parallel_plan(tp_plan))
         ep_plan = self._expand_parallel_plan(ep_plan)
         fsdp_plan = self._expand_parallel_plan(fsdp_plan)
         # FSDP2 needs a submodule sharded before the module containing it, e.g. `mlp.gate` before its layer.
