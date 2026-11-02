@@ -137,6 +137,7 @@ if is_torch_available():
     from torch import nn
 
     from transformers import MODEL_MAPPING
+    from transformers.distributed.configuration_utils import DistributedConfig
     from transformers.distributed.parallel_utils import _get_parameter_plan
     from transformers.integrations.accelerate import compute_module_sizes
     from transformers.modeling_utils import load_state_dict
@@ -5013,6 +5014,29 @@ class ModelTesterMixin(ExportTesterMixin):
                 f"{model_class.__name__} ties `{head_name}` to its input embedding, so a tying checkpoint shards the "
                 "weight it reads and it needs a TP-plan entry of its own (`colwise_gather_output`)",
             )
+
+    def test_tied_weights_are_sharded_together(self):
+        """Tied weights are one parameter, so either all of their modules are sharded or none: a tied head over a
+        replicated embedding gives wrong logits, and an embedding without a TP hook can't take a sharded weight. Checks
+        the plan resolved for tp>1, so it also covers models whose only rule is the head's, without a
+        `base_model_tp_plan`."""
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            model = model_class(copy.deepcopy(config))
+            if not model.tp_plan:
+                continue
+            tp_plan, _, _ = model._resolve_parallel_plans(DistributedConfig(tp_size=2))
+
+            # the resolved plan names concrete modules or parameters, without wildcards
+            def is_sharded(name):
+                return name in tp_plan or name.rpartition(".")[0] in tp_plan
+
+            for target, source in model.all_tied_weights_keys.items():
+                self.assertEqual(
+                    is_sharded(target),
+                    is_sharded(source),
+                    f"{model_class.__name__} shards only one of `{target}` and `{source}` at tp>1, which are tied",
+                )
 
     def test_reverse_loading_mapping(self, check_keys_were_modified=True, skip_base_model=False):
         """Make sure we can load and save correctly the models having any weight renaming mapping or weight conversion

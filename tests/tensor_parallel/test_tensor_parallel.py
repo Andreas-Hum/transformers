@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import tempfile
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+from parameterized import parameterized
 
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 from transformers.distributed import tensor_parallel
+from transformers.distributed.configuration_utils import DistributedConfig
 from transformers.distributed.sharding_utils import DtensorShardOperation
 from transformers.distributed.tensor_parallel import (
     ALL_PARALLEL_STYLES,
@@ -27,6 +31,38 @@ from transformers.distributed.tensor_parallel import (
     get_kv_heads_per_rank,
 )
 from transformers.testing_utils import TestCasePlus, is_tensor_parallel_test
+
+from ..distributed_testing_utils import run_distributed
+
+
+def _tiny_llama_config(**kwargs):
+    return LlamaConfig(
+        vocab_size=99,
+        hidden_size=32,
+        intermediate_size=37,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        **kwargs,
+    )
+
+
+def _test_head_only_tp_plan_matches_tp1_impl(_rank, model_path):
+    # Without a `base_model_tp_plan`, the head's class-level rule is the whole TP plan (e.g. lfm2)
+    with patch.object(LlamaConfig, "base_model_tp_plan", None):
+        model_tp = LlamaForCausalLM.from_pretrained(
+            model_path, distributed_config=DistributedConfig(tp_size=dist.get_world_size())
+        )
+    assert set(model_tp.tp_plan) == {"lm_head"}, f"Expected a head-only TP plan, got {model_tp.tp_plan}"
+    model = LlamaForCausalLM.from_pretrained(model_path).to(model_tp.device)
+    assert model_tp.all_tied_weights_keys == model.all_tied_weights_keys, (
+        f"TP ties {model_tp.all_tied_weights_keys}, non-TP ties {model.all_tied_weights_keys}"
+    )
+
+    input_ids = torch.arange(10, device=model_tp.device)[None]
+    with torch.no_grad():
+        torch.testing.assert_close(model_tp(input_ids).logits, model(input_ids).logits)
+    dist.barrier()
 
 
 @is_tensor_parallel_test
@@ -342,3 +378,24 @@ class TestTensorParallelLayer(TestCasePlus):
 
                 self.assertEqual(module.random_attr, 123)
                 self.assertFalse(hasattr(module, "num_experts"))
+
+
+@is_tensor_parallel_test
+class TestTensorParallelTiedWeights(TestCasePlus):
+    """A tied `lm_head` whose TP rule is the model's only one: its embedding is not sharded by any plan."""
+
+    def test_tied_head_matches_tp1(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            LlamaForCausalLM(_tiny_llama_config(tie_word_embeddings=True)).save_pretrained(tmp_dir)
+            run_distributed(world_size=2)(_test_head_only_tp_plan_matches_tp1_impl)(tmp_dir)
+
+    @parameterized.expand([("equal", True), ("different", False)])
+    def test_checkpoint_with_both_tied_keys_matches_tp1(self, _, equal):
+        """A tying config whose checkpoint stores both keys: `tie_weights` ties them only if they are equal."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model = LlamaForCausalLM(_tiny_llama_config(tie_word_embeddings=False))
+            if equal:
+                model.lm_head.weight.data.copy_(model.model.embed_tokens.weight)
+            model.save_pretrained(tmp_dir)
+            _tiny_llama_config(tie_word_embeddings=True).save_pretrained(tmp_dir)
+            run_distributed(world_size=2)(_test_head_only_tp_plan_matches_tp1_impl)(tmp_dir)
